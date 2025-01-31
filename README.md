@@ -2,11 +2,17 @@
 
 A modern IPTV player application with a clean user interface built using Python and CustomTkinter.
 
+![IPTV Player Screenshot](screenshot.png)
+
 ## Features
-- Modern and clean user interface
+- Modern and clean user interface with dark/light mode support
 - Secure credential storage with encryption
 - Category-based channel organization
-- Live IPTV stream playback
+- Live IPTV stream playback with MPV backend
+- Customizable video playback settings
+- Volume control and mute functionality
+- Fullscreen support
+- Remember login credentials option
 - Channel favorites and search (coming soon)
 - EPG support (coming soon)
 
@@ -15,6 +21,7 @@ A modern IPTV player application with a clean user interface built using Python 
 - Secure key generation and storage
 - No plain text password storage
 - Encrypted configuration files
+- Secure storage location in user's AppData directory
 
 ## Prerequisites
 
@@ -43,50 +50,21 @@ pip install -r requirements.txt
 - requests==2.31.0: HTTP client for API communication
 - pillow==10.2.0: Image processing
 - cryptography==42.0.2: Secure credential storage
+- pyinstaller==6.4.0: For creating standalone executables
 
 ## Running the Application
 
-To run the application, simply execute:
+To run from source:
 ```bash
 python iptv_player.py
 ```
 
-## Configuration
-- The application automatically creates necessary configuration files on first run
-- Credentials are securely stored in an encrypted format
-- A secure encryption key is generated and stored in `.key` file
-- Settings are saved in `settings.json`
+To run the compiled executable:
+1. Download the latest release from the releases page
+2. Extract the archive
+3. Run IPTV_Player.exe
 
-## Requirements
-- Python 3.8+
-- MPV player installed
-- Internet connection for IPTV streams
-- Valid IPTV service credentials
-
-## Security Notes
-- Never share your `.key` file
-- Keep your credentials.json and .key files secure
-- The application uses Fernet encryption for storing sensitive data
-- API communications use your original credentials for authentication
-
-## Troubleshooting
-1. If you encounter MPV-related errors:
-   - Ensure MPV is properly installed on your system
-   - Check if the MPV executable is in your system PATH
-   - For Windows users, ensure the MPV DLL is in the lib directory
-
-2. If you have login issues:
-   - Verify your IPTV service credentials
-   - Check your internet connection
-   - Ensure the IPTV service is operational
-
-## Contributing
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-## License
-[Add your license information here]
-
-## Building the Executable
+## Building from Source
 
 ### Prerequisites for Building
 - All the regular prerequisites
@@ -105,11 +83,63 @@ python build.py
 
 3. The executable will be created in the `dist/IPTV_Player` directory
 
-### Notes for Windows Users
-- Make sure MPV is installed and the `mpv-2.dll` is in the `lib` directory
-- The executable requires the MPV DLL to be present in the lib folder
-- You can create a shortcut to the executable for easier access
+## Configuration and Data Storage
+- All user data is stored in the AppData directory:
+  - Windows: `%APPDATA%\IPTV_Player\`
+  - Linux/Mac: `~/.IPTV_Player/`
+- Configuration files:
+  - credentials.json: Encrypted login credentials
+  - settings.json: Application settings
+  - .key: Encryption key file
 
-### Notes for Linux/macOS Users
-- Make sure MPV is installed system-wide
-- The executable will use the system's MPV installation 
+## Security Notes
+- Never share your `.key` file
+- Keep your credentials.json and .key files secure
+- The application uses Fernet encryption for storing sensitive data
+- API communications use your original credentials for authentication
+- All sensitive data is stored in the user's AppData directory
+
+## Troubleshooting
+1. If you encounter MPV-related errors:
+   - Ensure MPV is properly installed on your system
+   - Check if the MPV executable is in your system PATH
+   - For Windows users, ensure the MPV DLL is in the lib directory
+
+2. If you have login issues:
+   - Verify your IPTV service credentials
+   - Check your internet connection
+   - Ensure the IPTV service is operational
+
+3. If "Remember me" is not working:
+   - Check if the application has write permissions in AppData
+   - Try running the application as administrator once
+   - Check if antivirus is blocking file access
+
+## Development
+
+### Project Structure
+```
+iptv-player/
+├── iptv_player.py    # Main application file
+├── build.py          # Build script
+├── requirements.txt  # Python dependencies
+├── LICENSE          # MIT License
+├── README.md        # This file
+└── lib/             # MPV library files
+    └── mpv-2.dll    # MPV DLL for Windows
+```
+
+### Contributing
+1. Fork the repository
+2. Create your feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit your changes (`git commit -m 'Add some amazing feature'`)
+4. Push to the branch (`git push origin feature/amazing-feature`)
+5. Open a Pull Request
+
+## License
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+## Acknowledgments
+- [CustomTkinter](https://github.com/TomSchimansky/CustomTkinter) for the modern UI framework
+- [MPV](https://mpv.io/) for the powerful video playback engine
+- [python-mpv](https://github.com/jaseg/python-mpv) for the MPV Python bindings 
