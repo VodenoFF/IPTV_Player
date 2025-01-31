@@ -2,7 +2,6 @@
 
 A modern IPTV player application with a clean user interface built using Python and CustomTkinter.
 
-![IPTV Player Screenshot](screenshot.png)
 
 ## Features
 - Modern and clean user interface with dark/light mode support
@@ -35,7 +34,7 @@ A modern IPTV player application with a clean user interface built using Python 
 
 1. Clone the repository:
 ```bash
-git clone [repository-url]
+git clone https://github.com/VodenoFF/IPTV_Player
 cd iptv-player
 ```
 
