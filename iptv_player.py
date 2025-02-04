@@ -10,7 +10,7 @@ from io import BytesIO
 import threading
 import sys
 from concurrent.futures import ThreadPoolExecutor
-from queue import Queue
+from queue import Queue, Empty
 import time
 import base64
 from cryptography.fernet import Fernet
@@ -39,6 +39,413 @@ logging.basicConfig(level=logging.INFO,
                    handlers=[
                        logging.StreamHandler()  # Only log to console
                    ])
+
+class ImageCache:
+    def __init__(self, max_size=100):
+        self.cache = {}
+        self.max_size = max_size
+        self.access_times = {}
+        self.lock = threading.Lock()
+        
+    def get(self, key):
+        with self.lock:
+            if key in self.cache:
+                self.access_times[key] = time.time()
+                return self.cache[key]
+            return None
+            
+    def put(self, key, value):
+        with self.lock:
+            if len(self.cache) >= self.max_size:
+                # Remove least recently used items
+                oldest = sorted(self.access_times.items(), key=lambda x: x[1])[0][0]
+                del self.cache[oldest]
+                del self.access_times[oldest]
+            
+            self.cache[key] = value
+            self.access_times[key] = time.time()
+            
+    def clear(self):
+        with self.lock:
+            self.cache.clear()
+            self.access_times.clear()
+
+class BatchedUIUpdater:
+    def __init__(self, window, batch_size=10, update_interval=50):
+        self.window = window
+        self.batch_size = batch_size
+        self.update_interval = update_interval
+        self.update_queue = Queue()
+        self.is_running = True
+        self.update_thread = threading.Thread(target=self._process_updates, daemon=True)
+        self.update_thread.start()
+        
+    def queue_update(self, update_func):
+        self.update_queue.put(update_func)
+        
+    def _process_updates(self):
+        while self.is_running:
+            updates = []
+            try:
+                # Get first update
+                updates.append(self.update_queue.get(timeout=0.1))
+                
+                # Try to get more updates up to batch size
+                for _ in range(self.batch_size - 1):
+                    try:
+                        updates.append(self.update_queue.get_nowait())
+                    except Empty:
+                        break
+                        
+                if updates:
+                    # Combine updates into a single operation
+                    def batch_update():
+                        for update in updates:
+                            try:
+                                update()
+                            except Exception as e:
+                                logging.error(f"Error in batched update: {str(e)}")
+                    
+                    self.window.after(0, batch_update)
+                    time.sleep(self.update_interval / 1000)  # Convert to seconds
+                    
+            except Empty:
+                time.sleep(0.1)  # Prevent busy waiting
+            except Exception as e:
+                logging.error(f"Error processing batched updates: {str(e)}")
+                
+    def shutdown(self):
+        self.is_running = False
+        if self.update_thread.is_alive():
+            self.update_thread.join(timeout=1.0)
+
+class ChannelWidgetPool:
+    def __init__(self, parent):
+        self.parent = parent
+        self.available_widgets = []
+        self.active_widgets = {}
+        self.pool_size = 20  # Initial pool size
+        
+    def get_widget(self):
+        """Get a widget from the pool or create a new one"""
+        if not self.available_widgets:
+            self._create_widgets(max(5, self.pool_size // 2))
+            
+        widget = self.available_widgets.pop()
+        self.active_widgets[id(widget)] = widget
+        return widget
+        
+    def return_widget(self, widget):
+        """Return a widget to the pool"""
+        widget_id = id(widget)
+        if widget_id in self.active_widgets:
+            del self.active_widgets[widget_id]
+            widget.grid_remove()  # Hide but keep the widget
+            self.available_widgets.append(widget)
+            
+    def _create_widgets(self, count):
+        """Create new widgets for the pool"""
+        for _ in range(count):
+            # Create main channel frame
+            channel_frame = ctk.CTkFrame(
+                self.parent,
+                fg_color=("gray90", "gray20"),
+                corner_radius=10,
+                border_width=1,
+                border_color=("gray80", "gray30")
+            )
+            channel_frame.grid_columnconfigure(1, weight=1)
+            
+            # Content frame
+            content_frame = ctk.CTkFrame(
+                channel_frame,
+                fg_color="transparent"
+            )
+            content_frame.grid(row=0, column=0, sticky="ew", padx=8, pady=8)
+            content_frame.grid_columnconfigure(1, weight=1)
+            
+            # Icon frame
+            icon_frame = ctk.CTkFrame(
+                content_frame,
+                fg_color=("gray85", "gray25"),
+                corner_radius=8,
+                width=40,
+                height=40
+            )
+            icon_frame.grid(row=0, column=0, padx=(0, 10))
+            icon_frame.grid_propagate(False)
+            
+            # Placeholder icon
+            placeholder = ctk.CTkLabel(
+                icon_frame,
+                text="📺",
+                font=("Helvetica", 16),
+                text_color=("gray60", "gray60")
+            )
+            placeholder.place(relx=0.5, rely=0.5, anchor="center")
+            
+            # Channel name label
+            name_label = ctk.CTkLabel(
+                content_frame,
+                text="",
+                font=("Helvetica", 12),
+                anchor="w",
+                text_color=("gray20", "gray90")
+            )
+            name_label.grid(row=0, column=1, sticky="w")
+            
+            # Store references
+            channel_frame.content_frame = content_frame
+            channel_frame.icon_frame = icon_frame
+            channel_frame.placeholder = placeholder
+            channel_frame.name_label = name_label
+            
+            self.available_widgets.append(channel_frame)
+
+    def clear_all(self):
+        """Hide all active widgets"""
+        for widget in list(self.active_widgets.values()):
+            self.return_widget(widget)
+
+class ChannelList:
+    def __init__(self, parent, width=240):
+        self.parent = parent
+        self.width = width
+        self.channels = []
+        self.item_height = 40
+        self.hover_index = -1
+        self.selected_index = -1
+        self.scroll_offset = 0
+        self.on_channel_click = None
+        self.last_render_time = 0
+        self.render_buffer = 10  # Number of items to render above/below viewport
+        self.is_scrolling = False
+        self.scroll_timer = None
+        
+        # Create main container
+        self.container = ctk.CTkFrame(
+            parent,
+            fg_color=("gray95", "gray10"),
+            corner_radius=0
+        )
+        self.container.grid(row=0, column=0, sticky="nsew")
+        self.container.grid_columnconfigure(0, weight=1)
+        self.container.grid_rowconfigure(0, weight=1)
+        
+        # Create canvas for custom rendering
+        self.canvas = ctk.CTkCanvas(
+            self.container,
+            bg="#1a1a1a",
+            highlightthickness=0,
+            borderwidth=0
+        )
+        self.canvas.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+        
+        # Create scrollbar
+        self.scrollbar = ctk.CTkScrollbar(
+            self.container,
+            command=self.canvas.yview,
+            button_color=("#404040", "#404040"),
+            button_hover_color=("#4a4a4a", "#4a4a4a"),
+            width=8
+        )
+        self.scrollbar.grid(row=0, column=1, sticky="ns")
+        
+        # Configure canvas scrolling
+        self.canvas.configure(yscrollcommand=self.on_scroll)
+        
+        # Bind events
+        self.canvas.bind("<Configure>", self._on_configure)
+        self.canvas.bind("<Motion>", self._on_motion)
+        self.canvas.bind("<Leave>", self._on_leave)
+        self.canvas.bind("<Button-1>", self._on_click)
+        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+        
+        # Create image cache
+        self.image_cache = {}
+        self.rendered_items = set()
+        
+    def on_scroll(self, *args):
+        """Handle scroll events with debouncing"""
+        self.scrollbar.set(*args)
+        self.is_scrolling = True
+        
+        # Cancel previous timer if exists
+        if self.scroll_timer:
+            self.parent.after_cancel(self.scroll_timer)
+        
+        # Schedule new render
+        self.scroll_timer = self.parent.after(50, self.handle_scroll_end)
+        
+        # Render immediately with larger buffer during scrolling
+        self.render(buffer_size=15)
+        
+    def handle_scroll_end(self):
+        """Handle end of scrolling"""
+        self.is_scrolling = False
+        self.scroll_timer = None
+        self.render(buffer_size=self.render_buffer)
+        
+    def _on_mousewheel(self, event):
+        """Handle mouse wheel scrolling"""
+        if self.canvas.winfo_height() < self.canvas.bbox("all")[3]:
+            self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            
+    def render(self, buffer_size=None):
+        """Render the channel list with buffering"""
+        if not self.channels:
+            return
+            
+        current_time = time.time()
+        if current_time - self.last_render_time < 0.016:  # Limit to ~60fps
+            return
+            
+        self.last_render_time = current_time
+        buffer_size = buffer_size or self.render_buffer
+        
+        try:
+            # Get visible range
+            visible_top = max(0, int(self.canvas.yview()[0] * len(self.channels)))
+            visible_bottom = min(len(self.channels), int(self.canvas.yview()[1] * len(self.channels)) + 1)
+            
+            # Calculate buffer range
+            start_idx = max(0, visible_top - buffer_size)
+            end_idx = min(len(self.channels), visible_bottom + buffer_size)
+            
+            # Get currently visible items
+            visible_items = set(range(start_idx, end_idx))
+            
+            # Remove items that are no longer visible
+            items_to_remove = self.rendered_items - visible_items
+            if items_to_remove:
+                self.canvas.delete(*[f"item_{idx}" for idx in items_to_remove])
+                self.rendered_items -= items_to_remove
+            
+            # Render new visible items
+            items_to_render = visible_items - self.rendered_items
+            for idx in items_to_render:
+                self._render_channel(idx)
+                self.rendered_items.add(idx)
+                
+        except Exception as e:
+            logging.error(f"Error in render: {str(e)}")
+            
+    def _render_channel(self, index):
+        """Render a single channel item with tags"""
+        if index >= len(self.channels):
+            return
+            
+        channel = self.channels[index]
+        y = index * self.item_height
+        
+        # Create tag for this item
+        item_tag = f"item_{index}"
+        
+        # Background
+        bg_color = "#2d7cd6" if index == self.selected_index else \
+                  "#333333" if index == self.hover_index else "#1a1a1a"
+        
+        # Draw background
+        self.canvas.create_rectangle(
+            4, y + 2,
+            self.width - 4, y + self.item_height - 2,
+            fill=bg_color,
+            outline="",
+            tags=(item_tag, "bg")
+        )
+        
+        # Channel name
+        text_color = "#ffffff" if index in (self.hover_index, self.selected_index) else "#cccccc"
+        self.canvas.create_text(
+            45, y + self.item_height//2,
+            text=channel['name'],
+            fill=text_color,
+            anchor="w",
+            font=("Segoe UI", 11),
+            tags=(item_tag, "text")
+        )
+        
+        # Icon background
+        icon_size = 28
+        icon_x = 8
+        icon_y = y + (self.item_height - icon_size) // 2
+        
+        self.canvas.create_rectangle(
+            icon_x, icon_y,
+            icon_x + icon_size, icon_y + icon_size,
+            fill="#2b2b2b",
+            outline="#333333",
+            width=1,
+            tags=(item_tag, "icon_bg")
+        )
+        
+        # Load icon if available and not scrolling fast
+        if channel.get('stream_icon') and not self.is_scrolling:
+            if channel['stream_icon'] not in self.image_cache:
+                self._load_icon(channel['stream_icon'], index, item_tag)
+            elif self.image_cache[channel['stream_icon']]:
+                self.canvas.create_image(
+                    icon_x + icon_size//2,
+                    icon_y + icon_size//2,
+                    image=self.image_cache[channel['stream_icon']],
+                    tags=(item_tag, "icon")
+                )
+                
+    def _load_icon(self, url, index, item_tag):
+        """Load channel icon with delayed rendering"""
+        def on_icon_loaded(icon):
+            if icon and not self.is_scrolling:
+                self.image_cache[url] = icon
+                if index in self.rendered_items:
+                    self._render_channel(index)
+        
+        if hasattr(self.parent, 'icon_load_queue'):
+            self.parent.icon_load_queue.put((url, on_icon_loaded))
+
+    def set_channels(self, channels):
+        """Set the list of channels to display"""
+        self.channels = channels
+        self.scroll_offset = 0
+        self.hover_index = -1
+        self.selected_index = -1
+        self._update_scroll_region()
+        self.render()
+        
+    def _update_scroll_region(self):
+        """Update the canvas scroll region"""
+        total_height = len(self.channels) * self.item_height
+        self.canvas.configure(scrollregion=(0, 0, self.width, total_height))
+        
+    def _on_configure(self, event):
+        """Handle canvas resize"""
+        self.width = event.width
+        self.render()
+        
+    def _on_motion(self, event):
+        """Handle mouse motion for hover effects"""
+        y = self.canvas.canvasy(event.y)  # Convert to canvas coordinates
+        index = int(y // self.item_height)
+        
+        if 0 <= index < len(self.channels) and index != self.hover_index:
+            self.hover_index = index
+            self.render()
+            
+    def _on_leave(self, event):
+        """Handle mouse leave"""
+        if self.hover_index != -1:
+            self.hover_index = -1
+            self.render()
+            
+    def _on_click(self, event):
+        """Handle channel selection"""
+        y = self.canvas.canvasy(event.y)
+        index = int(y // self.item_height)
+        
+        if 0 <= index < len(self.channels):
+            self.selected_index = index
+            if self.on_channel_click:
+                self.on_channel_click(self.channels[index])
+            self.render()
 
 class IPTVPlayer:
     def __init__(self):
@@ -109,6 +516,13 @@ class IPTVPlayer:
         
         # Create login frame
         self.create_login_frame()
+        
+        # Add after other initializations
+        self.channel_pool = None  # Will be initialized when channels frame is created
+        
+        # Add after other initializations
+        self.image_cache = ImageCache(max_size=100)
+        self.ui_updater = None  # Will be initialized after window creation
         
     def init_encryption(self):
         """Initialize encryption key"""
@@ -333,6 +747,20 @@ class IPTVPlayer:
         for entry in [self.username_entry, self.password_entry]:
             entry.bind("<Enter>", lambda e, widget=entry: self.on_entry_hover(widget, True))
             entry.bind("<Leave>", lambda e, widget=entry: self.on_entry_hover(widget, False))
+            
+        # Add paste functionality
+        def paste_to_entry(event):
+            widget = event.widget
+            try:
+                widget.delete("sel.first", "sel.last")
+            except:
+                pass
+            widget.insert("insert", self.window.clipboard_get())
+            return "break"
+            
+        # Bind Ctrl+V to both entry fields
+        self.username_entry.bind("<Control-v>", paste_to_entry)
+        self.password_entry.bind("<Control-v>", paste_to_entry)
 
     def on_entry_hover(self, widget, entering):
         """Handle hover effect for entry widgets"""
@@ -648,6 +1076,23 @@ class IPTVPlayer:
         left_panel.grid_rowconfigure(1, weight=0)
         left_panel.grid_rowconfigure(2, weight=1)
         
+        # Create the channels frame first
+        self.channels_frame = ctk.CTkScrollableFrame(
+            left_panel,
+            fg_color="transparent",
+            corner_radius=0,
+            width=240,
+            scrollbar_button_color=("gray75", "gray30"),
+            scrollbar_button_hover_color=("gray65", "gray35")
+        )
+        self.channels_frame.grid(row=2, column=0, sticky="nsew", padx=10, pady=5)
+        
+        # Initialize the channel pool
+        self.channel_pool = ChannelWidgetPool(self.channels_frame)
+        
+        # Initialize UI updater
+        self.ui_updater = BatchedUIUpdater(self.window)
+
         # Categories section with header
         categories_header = ctk.CTkLabel(
             left_panel,
@@ -685,27 +1130,6 @@ class IPTVPlayer:
                 font=("Helvetica", 11)
             )
             btn.grid(row=i, column=0, padx=5, pady=2, sticky="ew")
-        
-        # Channels section with adjusted position
-        channels_container = ctk.CTkFrame(
-            left_panel,
-            fg_color="transparent",
-            width=240  # Match width with categories
-        )
-        channels_container.grid(row=2, column=0, sticky="nsew", padx=10, pady=5)
-        channels_container.grid_columnconfigure(0, weight=1)
-        channels_container.grid_rowconfigure(0, weight=1)
-        
-        # Modern channels frame
-        self.channels_frame = ctk.CTkScrollableFrame(
-            channels_container,
-            fg_color="transparent",
-            corner_radius=0,
-            width=240,  # Match width with categories
-            scrollbar_button_color=("gray75", "gray30"),
-            scrollbar_button_hover_color=("gray65", "gray35")
-        )
-        self.channels_frame.grid(row=0, column=0, sticky="nsew")
         
         # Right panel (player) with modern design
         self.player_frame = ctk.CTkFrame(
@@ -964,11 +1388,11 @@ class IPTVPlayer:
                 f"Error: {str(e)}")
             self.player = None
         
-        # Show first category's channels
+        # Show first category's channels after everything is initialized
         if self.categories:
             first_category = next(iter(self.categories.keys()))
             self.show_category_channels(first_category)
-            
+
     def on_mouse_motion(self, event=None):
         """Handle mouse motion to show/hide controls"""
         # Get mouse position relative to video container
@@ -1007,7 +1431,7 @@ class IPTVPlayer:
                 self.show_controls()
         else:
             # Hide controls if mouse moves away and not over volume controls
-            if self.controls_visible and not mouse_over_controls:
+            if self.controls_visible:
                 if self.hide_controls_timer:
                     self.window.after_cancel(self.hide_controls_timer)
                 self.hide_controls_timer = self.window.after(500, self.hide_controls)
@@ -1136,9 +1560,39 @@ class IPTVPlayer:
         
         self.is_fullscreen = not self.is_fullscreen
         
+        # Store current volume and mute states
+        current_volume = self.volume_slider.get()
+        current_mute = self.is_muted
+        
         if self.is_fullscreen:
-            # Set window to fullscreen
+            # Store current window position and size before going fullscreen
+            self.before_fullscreen = {
+                'geometry': self.window.geometry(),
+                'x': self.window.winfo_x(),
+                'y': self.window.winfo_y(),
+                'width': self.window.winfo_width(),
+                'height': self.window.winfo_height(),
+                'volume': current_volume,
+                'muted': current_mute
+            }
+            
+            # Get current monitor
+            x = self.window.winfo_x()
+            y = self.window.winfo_y()
+            width = self.window.winfo_width()
+            height = self.window.winfo_height()
+            
+            # Calculate center point of the window
+            center_x = x + width // 2
+            center_y = y + height // 2
+            
+            # Get monitor info where the center of the window is
+            monitor_info = self.window.winfo_containing(center_x, center_y).winfo_toplevel().winfo_geometry()
+            mon_x, mon_y, mon_width, mon_height = map(int, monitor_info.replace('x', '+').split('+'))
+            
+            # Set window to fullscreen on the current monitor
             self.window.attributes('-fullscreen', True)
+            self.window.geometry(f"{mon_width}x{mon_height}+{mon_x}+{mon_y}")
             self.fullscreen_button.configure(text="⛗")
             
             # Hide left panel
@@ -1160,8 +1614,11 @@ class IPTVPlayer:
             self.main_frame.grid_columnconfigure(1, weight=1)  # Player column
             
         else:
-            # Exit fullscreen
+            # Exit fullscreen and restore previous position
             self.window.attributes('-fullscreen', False)
+            if hasattr(self, 'before_fullscreen'):
+                self.window.geometry(self.before_fullscreen['geometry'])
+            
             self.fullscreen_button.configure(text="⛶")
             
             # Show left panel
@@ -1182,7 +1639,27 @@ class IPTVPlayer:
             self.main_frame.grid_columnconfigure(1, weight=3)  # Player column
             
             self.is_fullscreen = False
-    
+        
+        # Restore volume and mute states
+        if hasattr(self, 'before_fullscreen'):
+            if current_mute:
+                self.volume_slider.set(0)
+                self.volume_button.configure(text="🔇")
+            else:
+                self.volume_slider.set(current_volume)
+                if current_volume == 0:
+                    self.volume_button.configure(text="🔇")
+                elif current_volume < 50:
+                    self.volume_button.configure(text="🔈")
+                else:
+                    self.volume_button.configure(text="🔊")
+            
+            # Ensure player state matches UI
+            if self.player:
+                self.player.mute = current_mute
+                if not current_mute:
+                    self.player.volume = current_volume
+
     def exit_fullscreen(self, event=None):
         if self.is_fullscreen:
             self.toggle_fullscreen()
@@ -1211,6 +1688,7 @@ class IPTVPlayer:
             self.player.mute = False
             self.volume_slider.set(self.last_volume)
             self.set_volume(self.last_volume)
+            self.volume_button.configure(text="🔊" if self.last_volume >= 50 else "🔈")
             self.is_muted = False
 
     def previous_channel(self):
@@ -1281,95 +1759,152 @@ class IPTVPlayer:
                 f"An error occurred while trying to play the channel: {str(e)}")
 
     def load_channel_icon(self, icon_url):
-        """Load channel icon with memory-only caching and error handling"""
+        """Load channel icon with improved caching"""
         if not icon_url or not icon_url.startswith(('http://', 'https://')):
             return None
             
         # Check memory cache first
-        if icon_url in self.stream_icons:
-            return self.stream_icons[icon_url]
+        cached_icon = self.image_cache.get(icon_url)
+        if cached_icon:
+            return cached_icon
             
         # Check if this URL previously failed
         if icon_url in self.failed_icons:
             return None
             
         try:
-            # Download image
+            # Download image with timeout and caching
             headers = {
                 'User-Agent': 'Mozilla/5.0',
                 'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8'
             }
-            response = requests.get(icon_url, timeout=5, headers=headers, stream=True)
-            response.raise_for_status()
             
-            # Process image data
-            img_data = BytesIO(response.content)
-            with Image.open(img_data) as img:
-                # Convert and resize
-                if img.mode not in ('RGB', 'RGBA'):
-                    img = img.convert('RGBA')
+            # Use session for connection pooling
+            with requests.Session() as session:
+                response = session.get(
+                    icon_url,
+                    timeout=5,
+                    headers=headers,
+                    stream=True
+                )
+                response.raise_for_status()
                 
-                # Keep aspect ratio
-                width, height = img.size
-                aspect_ratio = width / height
-                if aspect_ratio > 1:
-                    new_width, new_height = 40, int(40 / aspect_ratio)
-                else:
-                    new_width, new_height = int(40 * aspect_ratio), 40
-                
-                img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-                
-                # Create CTkImage and cache it in memory only
-                ctk_image = ctk.CTkImage(light_image=img, dark_image=img, size=(new_width, new_height))
-                self.stream_icons[icon_url] = ctk_image
-                return ctk_image
+                # Process image data
+                img_data = BytesIO(response.content)
+                with Image.open(img_data) as img:
+                    # Convert and resize efficiently
+                    if img.mode not in ('RGB', 'RGBA'):
+                        img = img.convert('RGBA')
+                    
+                    # Keep aspect ratio with efficient resizing
+                    width, height = img.size
+                    aspect_ratio = width / height
+                    if aspect_ratio > 1:
+                        new_width, new_height = 40, int(40 / aspect_ratio)
+                    else:
+                        new_width, new_height = int(40 * aspect_ratio), 40
+                    
+                    # Use LANCZOS for better quality-performance trade-off
+                    img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                    
+                    # Create and cache CTkImage
+                    ctk_image = ctk.CTkImage(
+                        light_image=img,
+                        dark_image=img,
+                        size=(new_width, new_height)
+                    )
+                    
+                    self.image_cache.put(icon_url, ctk_image)
+                    return ctk_image
                 
         except Exception as e:
             logging.error(f"Error loading icon {icon_url}: {str(e)}")
-            self.failed_icons.add(icon_url)  # Mark this URL as failed
+            self.failed_icons.add(icon_url)
             return None
 
     def update_channel_icon(self, icon_frame, icon):
-        """Update channel frame with loaded icon, with proper error handling"""
+        """Update channel frame with loaded icon using batched updates"""
+        if not icon_frame or not icon_frame.winfo_exists():
+            return
+        
+        def update():
+            try:
+                if not icon_frame.winfo_exists():
+                    return
+                    
+                # Remove old icon if exists
+                if hasattr(icon_frame, 'icon_label'):
+                    icon_frame.icon_label.destroy()
+                    
+                if icon:
+                    # Create new icon label
+                    icon_label = ctk.CTkLabel(
+                        icon_frame,
+                        text="",
+                        image=icon
+                    )
+                    icon_label.place(relx=0.5, rely=0.5, anchor="center")
+                    
+                    # Store references
+                    icon_frame.icon_label = icon_label
+                    icon_frame.icon = icon
+                    
+                    # Hide placeholder
+                    if hasattr(icon_frame, 'placeholder'):
+                        icon_frame.placeholder.place_forget()
+                    
+            except Exception as e:
+                logging.error(f"Error updating channel icon: {str(e)}")
+        
+        # Queue the update
+        if hasattr(self, 'ui_updater') and self.ui_updater:
+            self.ui_updater.queue_update(update)
+        else:
+            self.window.after(0, update)
+
+    def show_category_channels(self, category_name):
+        """Show channels for the selected category"""
         try:
-            if not icon_frame or not icon_frame.winfo_exists():
-                return
+            # Clear existing channels
+            for widget in self.channels_frame.winfo_children():
+                widget.destroy()
             
-            # Get all existing children before destroying
-            children = icon_frame.winfo_children()
+            category_info = self.categories[category_name]
             
-            # Schedule destruction on main thread
-            def destroy_children():
-                try:
-                    for child in children:
-                        if child.winfo_exists():
-                            child.destroy()
-                except Exception as e:
-                    logging.error(f"Error destroying icon children: {str(e)}")
+            # Add category name header
+            header = ctk.CTkLabel(
+                self.channels_frame,
+                text=category_name,
+                font=("Helvetica", 14, "bold"),
+                text_color=("gray20", "gray90")
+            )
+            header.grid(row=0, column=0, padx=5, pady=(5, 10), sticky="w")
             
-            self.window.after(0, destroy_children)
-            
-            # Schedule icon creation on main thread
-            def create_icon():
-                try:
-                    if icon and icon_frame.winfo_exists():
-                        icon_label = ctk.CTkLabel(
-                            icon_frame,
-                            text="",
-                            image=icon
-                        )
-                        icon_label.place(relx=0.5, rely=0.5, anchor="center")
-                        
-                        # Store references
-                        icon_frame.icon_label = icon_label
-                        icon_frame.icon = icon
-                except Exception as e:
-                    logging.error(f"Error creating icon label: {str(e)}")
-            
-            self.window.after(10, create_icon)
-            
+            # Add channels for selected category
+            for i, channel in enumerate(category_info['channels']):
+                # Create channel frame with placeholder
+                channel_frame = self.create_channel_frame(i+1, channel)
+                if channel_frame and hasattr(channel_frame, 'icon_frame') and channel.get('stream_icon'):
+                    icon_url = channel['stream_icon']
+                    frame_ref = channel_frame.icon_frame
+                    
+                    def make_callback(frame):
+                        def update_icon(icon):
+                            try:
+                                if frame and frame.winfo_exists():
+                                    self.update_channel_icon(frame, icon)
+                            except Exception as e:
+                                logging.error(f"Error in icon callback: {str(e)}")
+                        return update_icon
+                    
+                    self.icon_load_queue.put((
+                        icon_url,
+                        make_callback(frame_ref)
+                    ))
+                    
         except Exception as e:
-            logging.error(f"Error updating channel icon: {str(e)}")
+            logging.error(f"Error showing category channels: {str(e)}")
+            messagebox.showerror("Error", f"Failed to show channels: {str(e)}")
 
     def create_channel_frame(self, index, channel):
         """Create channel frame with modern design"""
@@ -1383,7 +1918,7 @@ class IPTVPlayer:
                 border_color=("gray80", "gray30")
             )
             channel_frame.grid(row=index, column=0, sticky="ew", padx=8, pady=4)
-            channel_frame.grid_columnconfigure(1, weight=1)
+            channel_frame.grid_columnconfigure(0, weight=1)
             
             # Content frame
             content_frame = ctk.CTkFrame(
@@ -1404,7 +1939,7 @@ class IPTVPlayer:
             icon_frame.grid(row=0, column=0, padx=(0, 10))
             icon_frame.grid_propagate(False)
             
-            # Placeholder icon with modern style
+            # Placeholder
             placeholder = ctk.CTkLabel(
                 icon_frame,
                 text="📺",
@@ -1413,40 +1948,50 @@ class IPTVPlayer:
             )
             placeholder.place(relx=0.5, rely=0.5, anchor="center")
             
-            # Channel name with modern font
-            name_label = ctk.CTkLabel(
+            # Channel name
+            name = ctk.CTkLabel(
                 content_frame,
                 text=channel['name'],
                 font=("Helvetica", 12),
                 anchor="w",
                 text_color=("gray20", "gray90")
             )
-            name_label.grid(row=0, column=1, sticky="w")
+            name.grid(row=0, column=1, sticky="w")
             
             # Store references
+            channel_frame.channel_info = channel
+            channel_frame.icon_frame = icon_frame
+            channel_frame.placeholder = placeholder
+            channel_frame.content_frame = content_frame
+            channel_frame.name_label = name
+            
+            # Store references in icon frame
             icon_frame.channel_info = channel
             icon_frame.placeholder = placeholder
-            icon_frame.content_frame = content_frame
             icon_frame.channel_frame = channel_frame
-            icon_frame.name_label = name_label
             
             # Bind events
-            def create_click_handler(ch):
-                return lambda e: self.play_channel(ch)
+            def on_click(e, ch=channel):
+                self.play_channel(ch)
+                
+            def on_hover(entering):
+                if entering:
+                    channel_frame.configure(
+                        fg_color=("gray85", "gray25"),
+                        border_color=("#1f538d", "#2d7cd6")
+                    )
+                else:
+                    channel_frame.configure(
+                        fg_color=("gray90", "gray20"),
+                        border_color=("gray80", "gray30")
+                    )
+                
+            for widget in [channel_frame, content_frame, name]:
+                widget.bind("<Button-1>", on_click)
+                widget.bind("<Enter>", lambda e: on_hover(True))
+                widget.bind("<Leave>", lambda e: on_hover(False))
             
-            def create_hover_handler(frame, entering):
-                return lambda e: self.on_channel_hover(frame, entering)
-            
-            click_handler = create_click_handler(channel)
-            hover_enter = create_hover_handler(channel_frame, True)
-            hover_leave = create_hover_handler(channel_frame, False)
-            
-            for widget in [channel_frame, content_frame, name_label]:
-                widget.bind("<Button-1>", click_handler)
-                widget.bind("<Enter>", hover_enter)
-                widget.bind("<Leave>", hover_leave)
-            
-            return icon_frame
+            return channel_frame
             
         except Exception as e:
             logging.error(f"Error creating channel frame: {str(e)}")
@@ -1482,6 +2027,13 @@ class IPTVPlayer:
         if self.player:
             self.player.terminate()
 
+        # Add cleanup for new components
+        if hasattr(self, 'ui_updater'):
+            self.ui_updater.shutdown()
+        
+        if hasattr(self, 'image_cache'):
+            self.image_cache.clear()
+
     def run(self):
         self.window.mainloop()
 
@@ -1503,60 +2055,13 @@ class IPTVPlayer:
             self.volume_button.configure(text="🔊")
             self.is_muted = False
             
-        # Store last volume if not muted
-        if not self.is_muted:
+        # Store last volume if not muted and volume is greater than 0
+        if not self.is_muted and value > 0:
             self.last_volume = value
             self.save_settings()
-
-    def show_category_channels(self, category_name):
-        """Show channels with improved icon loading and widget management"""
-        try:
-            # Clear existing channels
-            for widget in self.channels_frame.winfo_children():
-                widget.destroy()
             
-            category_info = self.categories[category_name]
-            
-            # Add category name header with gray theme
-            header = ctk.CTkLabel(
-                self.channels_frame,
-                text=category_name,
-                font=("Helvetica", 14, "bold"),
-                text_color=("gray20", "gray90")
-            )
-            header.grid(row=0, column=0, padx=5, pady=(5, 10), sticky="w")
-            
-            # Add channels for selected category
-            for i, channel in enumerate(category_info['channels']):
-                # Create channel frame with placeholder
-                channel_frame = self.create_channel_frame(i+1, channel)
-                
-                # Store the frame reference in a list to prevent garbage collection
-                if not hasattr(self, '_channel_frames'):
-                    self._channel_frames = []
-                self._channel_frames.append(channel_frame)
-                
-                # Queue icon loading if available
-                if channel.get('stream_icon'):
-                    icon_url = channel['stream_icon']
-                    frame_ref = channel_frame
-                    
-                    def make_callback(frame):
-                        def update_icon(icon):
-                            try:
-                                if frame and frame.winfo_exists():
-                                    self.update_channel_icon(frame, icon)
-                            except Exception as e:
-                                logging.error(f"Error in icon callback: {str(e)}")
-                        return update_icon
-                    
-                    self.icon_load_queue.put((
-                        icon_url,
-                        make_callback(frame_ref)
-                    ))
-                    
-        except Exception as e:
-            logging.error(f"Error showing category channels: {str(e)}")
+        # Ensure player mute state matches UI
+        self.player.mute = self.is_muted
 
 if __name__ == "__main__":
     # Set the default theme
