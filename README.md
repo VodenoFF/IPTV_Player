@@ -18,7 +18,6 @@
 - [Troubleshooting](#troubleshooting)
 - [Architecture](#architecture)
 - [Contributing](#contributing)
-- [Roadmap](#roadmap)
 - [License](#license)
 - [Acknowledgments](#acknowledgments)
 - [Support](#support)
@@ -193,12 +192,6 @@ We welcome contributions from the community to enhance IPTV Player functionality
 5. Push to your branch (`git push origin feature/enhancement-name`)
 6. Submit a detailed Pull Request for review
 
-## Roadmap
-
-- **Q3 2023**: Favorites system implementation and UI refinements
-- **Q4 2023**: Advanced search capabilities and performance optimizations
-- **Q1 2024**: Comprehensive EPG integration
-- **Q2 2024**: Mobile companion application development
 
 ## License
 
